@@ -19,6 +19,31 @@ nonisolated struct ActivityScore: Identifiable, Hashable, Sendable {
     let activity: Activity
     /// Suitability from 0 (unsuitable) to 1 (ideal), or `nil` when the forecast lacks the data to judge.
     let score: Double?
+    let reason: ActivityScoreReason
 
     var id: Activity { activity }
+}
+
+/// Forecast evidence behind an activity's score, expressed in the same units as DailyWeather.
+nonisolated enum ActivityScoreReason: Hashable, Sendable {
+    nonisolated enum Input: Hashable, Sendable {
+        case precipitation
+        case snowfall
+        case windSpeed
+        case waveHeight
+    }
+
+    nonisolated enum OutdoorPenalty: Hashable, Sendable {
+        case fog
+        case thunderstorm
+    }
+
+    case skiing(highC: Double, snowfallCM: Double)
+    case skiingTooWarm(highC: Double)
+    case surfing(waveHeightM: Double, windKmh: Double, highC: Double)
+    case surfingWavesOutOfRange(waveHeightM: Double)
+    case surfingThunderstorm
+    case outdoorSightseeing(highC: Double, precipitationMM: Double, windKmh: Double, penalty: OutdoorPenalty?)
+    case indoorSightseeing(outdoorScore: Double)
+    case missingData([Input])
 }

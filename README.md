@@ -1,21 +1,30 @@
 # Weather Activities
 
-A native iOS app that ranks four activities (skiing, surfing, outdoor sightseeing and indoor sightseeing) for each of the next 7 days in any city, using Open-Meteo forecast data.
+Search for a city and see how skiing, surfing, outdoor sightseeing and indoor sightseeing rank on each day of its seven-day forecast. The app runs on iPhone and iPad and gets its weather from [Open-Meteo](https://open-meteo.com/).
+
+[Build and run](#d-how-to-build-and-run) · [Run tests](#e-how-to-run-tests-and-testing-strategy)
 
 ## a. Project overview
 
-**Flow:** search for a city → pick the exact place among same-name matches (Paris, France vs. Paris, Texas) → see a 7-day forecast where every day scores and ranks all four activities, best first.
+### Recent searches
 
-**Search screen**
-- Recent searches (the last 5 places opened) while the query is shorter than 2 characters.
-- Searching, results, "no results" and failure states. Failures offer Try Again.
-- Each result shows region and country to tell same-name places apart.
+[<img src="docs/screenshots/search-recents.png" width="300" alt="City search with a list of five recently opened places">](docs/screenshots/search-recents.png)
 
-**Forecast screen**
-- One card per day: date, weather condition, high/low, and four activity tiles ordered by score. The best activity is highlighted with a crown.
-- An activity without enough data shows "–" and ranks last (for example, surfing for an inland city).
-- States: loading, loaded, empty (no usable days) and failed (full-screen error with Try Again).
-- Pull to refresh, or tap the toolbar Refresh button, which appears once a forecast is loaded. The current forecast stays on screen while refreshing. If the refresh fails, a banner says so and keeps the earlier forecast.
+Tap a recent place to reopen its forecast, or type a city name to look up somewhere new. The app remembers the last five places you opened.
+
+### Search results
+
+[<img src="docs/screenshots/search-results.png" width="300" alt="Search results for San Fr with places in California, Mexico and the Philippines">](docs/screenshots/search-results.png)
+
+The app starts looking for matches after two characters. Check the region and country to pick the right place, then tap it to open the forecast. The keyboard's search button submits immediately.
+
+### Daily forecast
+
+[<img src="docs/screenshots/daily-forecast.png" width="300" alt="San Francisco forecast with four ranked activities, weather explanations and a crown next to outdoor sightseeing">](docs/screenshots/daily-forecast.png)
+
+Scroll through the week to see each day's weather, high and low temperatures, and four activity scores with their reasons. A crown marks the highest score. When a measurement is missing, such as wave height, the entry shows “No score” and explains why.
+
+Pull down or tap the refresh button to update the forecast. If the refresh fails, the current forecast stays visible with a Try Again button. VoiceOver reads the date and weather before the activity entries. At accessibility text sizes, the name and score stack so the explanation has room to wrap.
 
 ## b. Platform and tooling
 
@@ -29,21 +38,31 @@ A native iOS app that ranks four activities (skiing, surfing, outdoor sightseein
 | XCTest for the UI test | `XCUIApplication` is only available in XCTest |
 | No third-party dependencies | Nothing to resolve or keep updated |
 
-**Why Swift Testing rather than XCTest for unit tests.** The brief lists XCTest. I used Swift Testing, Apple's current test framework, which ships with Xcode and runs from the same scheme, test plan, ⌘U and `xcodebuild test`. It gave this project:
-- Parameterized tests (`@Test(arguments:)`) for the error translations, the forecast corruption cases and the marine fallbacks.
-- `#expect`/`#require` failure messages that show the values of each sub-expression.
-- Tests that run in parallel by default, which brings out any state shared between them.
+I chose Swift Testing for the unit tests. `@Test(arguments:)` lets the same test cover several API failures and malformed responses. `#expect` and `#require` show which values failed. XCTest runs the launch smoke test through the same Xcode scheme.
 
 ## c. Architecture and technical decisions
 
-### Layers
+The `App` layer wires the app together at launch through `AppDependencies.live()`. The search and forecast view models take `GeocodingRepository` and `WeatherRepository` through their initialisers. `RecentLocationsStore` uses an injected `UserDefaults` instance. The search view model uses that store directly.
+
+`Data` sends requests, decodes Open-Meteo responses and maps them into `Domain` models. `ActivityRecommendationService` is a pure function of the forecast. It returns a score and a typed reason for each activity, and SwiftUI turns the reason into display text.
+
+Each screen uses `switch` to render an explicit state. `SearchState` covers idle, searching, results, empty and failure. `ForecastState` carries a `RefreshStatus` when a forecast is loaded, so an error during refresh can keep the previous content on screen.
+
+Search waits 300 ms after typing, cancels the previous lookup when the query changes and discards cancelled results. `ForecastViewModel` shares one in-flight request guard across load, retry and refresh, and restores the previous state on cancellation. `OpenMeteoClient.get` uses `@concurrent` to run networking and decoding off the main actor. `OpenMeteoWeatherRepository` fetches weather and waves in parallel with `async let`.
+
+`RepositoryError` gives the screens a small set of failures to display. The initial error screen offers a retry. A failed Marine API request leaves wave data unavailable. The client maps `URLError.cancelled` to `CancellationError`, so cancellation propagates through both requests.
+
+<details>
+<summary>Source layout, screen states and error mapping</summary>
+
+The app target defaults to `MainActor` isolation. `Domain` imports Foundation. Types that cross actor boundaries in `Domain` and `Data` are `nonisolated` and `Sendable`. Leaving the forecast screen cancels its initial `.task`.
 
 ```
 weather-activities/
 ├── App/              Entry point, RootView (navigation), AppDependencies (composition root)
 ├── Presentation/
 │   ├── Search/       SearchViewModel, SearchScreen and its subviews
-│   ├── Forecast/     ForecastViewModel, ForecastScreen, day rows, activity tiles, refresh banner
+│   ├── Forecast/     ForecastViewModel, ForecastScreen, day cards, activity explanations, refresh banner
 │   ├── Shared/       Domain → UI mapping: names, SF Symbols, error messages, location detail
 │   └── DesignSystem/ Card surface, sky background, error state view, format styles
 ├── Domain/           Models, ActivityRecommendationService, repository protocols, RepositoryError
@@ -54,16 +73,6 @@ weather-activities/
 │   └── RecentLocationsStore.swift
 └── PreviewSupport/   Stub repositories and sample data for SwiftUI previews
 ```
-
-**Dependency rule:**
-- Domain depends on nothing but Foundation. It never imports SwiftUI.
-- Data implements Domain's repository protocols.
-- View models depend on those protocols and never see an Open-Meteo type. The only Data type they use directly is `RecentLocationsStore` (see Dependency injection).
-- Only `App` knows every layer, because it wires them together.
-
-### MVVM with explicit state
-
-Each screen has an `@Observable` view model that exposes a single state enum. Views `switch` over it, so an impossible combination (say, a spinner and an error at once) can't be represented.
 
 ```swift
 enum SearchState {
@@ -84,39 +93,6 @@ enum ForecastState {
 enum RefreshStatus { case idle, refreshing, failed(RepositoryError) }
 ```
 
-Previews and tests can start a view model in any state through its initializer.
-
-### Dependency injection
-
-- **Protocols only at real boundaries:** `GeocodingRepository` and `WeatherRepository` (what view models depend on) and `HTTPTransport` (what the networking client depends on). Tests replace each one.
-- **Concrete types everywhere else.** `ActivityRecommendationService` is a pure function of its input, so `ForecastViewModel` creates its own. `RecentLocationsStore` is a struct around an injected `UserDefaults`, and tests pass an isolated suite.
-- **Manual DI:** `AppDependencies.live()` builds the graph once at launch, and it's passed down through initializers. No container or service locator.
-
-### Concurrency
-
-- The app target defaults to `MainActor` isolation, so views and view models need no annotations.
-- Domain and Data types are `nonisolated` and `Sendable` value types, safe to use from any thread.
-- `OpenMeteoClient.get` is `@concurrent`, so networking *and* JSON decoding run off the main actor.
-- `OpenMeteoWeatherRepository` fetches the forecast and the marine data in parallel with `async let`.
-- Cancellation flows through: leaving the forecast screen cancels its `.task`, and `URLError.cancelled` is turned into `CancellationError` so it is never shown as a failure.
-
-### Search behaviour
-
-- Typing is debounced by 300 ms. Pressing Return searches immediately.
-- Queries are trimmed. Anything shorter than 2 characters returns to recent searches without a request.
-- Each new search cancels the previous one, and a response from a cancelled search is dropped, so a slow early response can't overwrite a newer one.
-- Opening a place records it in recent searches: up to 5, most recent first, de-duplicated by geocoding ID.
-
-### Refresh behaviour
-
-- The forecast stays on screen while refreshing. The toolbar shows a spinner instead of the Refresh button.
-- A failed refresh keeps the earlier forecast and shows a banner with Try Again.
-- One fetch at a time: `load()` only runs from `.loading`, and `refresh()` only runs from a loaded state that isn't already refreshing.
-
-### Error handling
-
-`RepositoryError` is the only error type the UI sees, and each case has its own title, message and symbol:
-
 | Case | Cause | Shown as |
 |---|---|---|
 | `connectivity` | No response: offline, timeout, DNS | "No Connection" |
@@ -124,34 +100,19 @@ Previews and tests can start a view model in any state through its initializer.
 | `decoding` | Body doesn't match the expected JSON | "Unexpected Data" |
 | `malformedForecast` | Decoded but inconsistent: unknown time zone, unparseable date, uneven arrays | "Unexpected Data" |
 
-- **Cancellation is never shown.** Repositories throw only `RepositoryError` or `CancellationError`, and view models ignore the latter.
-- **Marine data is optional.** Any marine failure other than cancellation means "no waves", so surfing is unscored while the rest of the forecast still shows.
-- **Incomplete days are dropped.** A day without a weather code (or with one that WMO doesn't define), a high or a low is skipped. Other missing values stay `nil` and are never treated as zero. A forecast with no usable days shows the empty state.
-
-### Time zones
-
-The forecast is requested with `timezone=auto`. Each day is parsed as midnight in the *city's* time zone, and the UI formats dates in that zone (passed through the SwiftUI environment). "Tue 17 Nov" is therefore the city's Tuesday, even when the device is elsewhere.
-
-### Accessibility
-
-- Each day card is one VoiceOver element. The label reads "Tuesday, 17 November, Sunny, high 18°, low 12°", and the value lists the ranking: "Outdoor sightseeing 100 %, Surfing 92 %, …".
-- At accessibility text sizes, day cards stack vertically and the activity tiles become a 2×2 grid. Fixed sizes scale with the text through `@ScaledMetric`.
-- Section titles are marked as headers, and decorative images are hidden from VoiceOver.
-- Colours come from asset catalog colours with dark variants.
+</details>
 
 ## d. How to build and run
 
 1. Open `weather-activities.xcodeproj` in Xcode 27.1 or later.
-2. Select the `weather-activities` scheme and any iOS 27 simulator.
+2. Select the `weather-activities` scheme and an iOS 27 simulator.
 3. Press ⌘R.
 
-To run on a device, select your own team under *Signing & Capabilities* (and change the bundle identifier if needed).
-
-There's no API key to configure and no package to resolve.
+For a physical device, select your own team in **Signing & Capabilities** and change the bundle identifier if needed. The project builds without an API key, a backend or third-party packages.
 
 ## e. How to run tests and testing strategy
 
-Press ⌘U in Xcode, or run:
+Press ⌘U in Xcode, or run `xcodebuild test` from the repository root.
 
 ```sh
 xcodebuild test \
@@ -160,38 +121,28 @@ xcodebuild test \
   -destination 'platform=iOS Simulator,name=iPhone Duo'
 ```
 
-Replace `iPhone Duo` with any iOS 27 simulator from `xcrun simctl list devices`. The UI test makes no network requests, so the whole suite runs offline.
+Replace `iPhone Duo` with an installed iOS 27 simulator from `xcrun simctl list devices`. The suite runs offline.
 
-### What is tested
+`ScriptedGeocodingRepository` and `ScriptedWeatherRepository` exercise view model transitions. `ControlledGeocodingRepository` delivers responses out of order to test stale search results. Forecast tests hold a request open to check overlapping actions and cancellation.
+
+`StubTransport` replaces `HTTPTransport` so tests can check request parameters and run the real decoding and mapping code against Open-Meteo responses captured on 2026-11-17. The `ForecastJSON` and `MarineJSON` builders let tests inject `null` or malformed data. `IsolatedDefaults` gives each persistence test its own suite.
+
+The UI test covers launch. SwiftUI previews cover the search and forecast states, including coastal and inland locations, dark mode and accessibility text sizes.
+
+<details>
+<summary>Test coverage by suite</summary>
 
 | Suite | Covers |
 |---|---|
-| `ActivityRecommendationServiceTests` | Each activity wins in its weather (dry and warm, rainy, fresh snow, good waves). A thunderstorm rules out surfing. Missing data leaves an activity unscored and last. Ties follow declaration order. Scores stay in 0…1. Days keep forecast order |
-| `ForecastViewModelTests` | Load, failure then retry, a refresh that fails (keeps content) or succeeds (replaces it), refresh ignored unless loaded or while already refreshing, empty forecast |
+| `ActivityRecommendationServiceTests` | Activity ranking, score range and tie order, forecast order, and reasons for weather inputs, cutoffs, penalties, and missing data |
+| `ForecastViewModelTests` | Load, failure then retry, refresh success and failure, overlapping actions, cancellation, empty forecast |
 | `SearchViewModelTests` | Minimum length (including whitespace), results, empty and failure, retry, clearing returns to idle, debounce (only the final query is searched), Return skips the debounce, stale responses ignored, recent searches |
 | `OpenMeteoGeocodingRepositoryTests` | Mapping live JSON, missing region, missing `results` key, query encoding, HTTP/connectivity/decoding failures, cancellation |
 | `OpenMeteoWeatherRepositoryTests` | With `ForecastMapper`: dates are midnights in the city's time zone, live values, `null`s stay `nil`, incomplete days skipped, 4 kinds of malformed forecast, HTTP failure, waves matched by date, every kind of unusable marine response means no waves, a cancelled marine request cancels the whole fetch, exact request parameters |
 | `RecentLocationsStoreTests` | Order, de-duplication, capacity, persistence across instances, same name with different IDs, unreadable data |
 | `LaunchUITests` (XCTest) | The app launches to the search screen |
 
-### Test doubles
-
-- **`ScriptedGeocodingRepository` / `ScriptedWeatherRepository`** return scripted results in order and record what was asked for.
-- **`ControlledGeocodingRepository`** holds each search until the test answers it, so responses can arrive out of order. That's how the stale-response test works.
-- **`StubTransport`** replaces `HTTPTransport`, so repository tests run the real client, decoding and mapping code. It records every request, so tests can check the exact URL parameters.
-  - Its responses are **live Open-Meteo JSON captured on 2026-11-17**: a Paris search, Singapore (no region), a search with no matches, forecasts for Paris TX and San Francisco, and waves for San Francisco and inland Chamonix (all `null`).
-  - The `ForecastJSON` and `MarineJSON` builders start from those live values. Tests edit them to add `null`s, unknown codes and corrupt data.
-- **`IsolatedDefaults`** gives each test its own `UserDefaults` suite and deletes it afterwards.
-
-### Previews
-
-27 SwiftUI previews cover every screen state with stub repositories and sample data modelled on real responses: coastal and inland forecasts, loading, failed, refresh failed, accessibility text sizes and dark mode. I used them to review each state visually during development.
-
-### Not tested
-
-- **No snapshot tests**, so visual regressions are caught only by reviewing previews.
-- **No live API contract test.** The fixtures prove the app handles responses as they were on 2026-11-17, but not that Open-Meteo still sends them.
-- **UI tests stop at the launch smoke test**, because driving the real UI further needs network data or a stub injected at launch (see j).
+</details>
 
 ## f. API usage notes
 
@@ -201,28 +152,36 @@ Replace `iPhone Duo` with any iOS 27 simulator from `xcrun simctl list devices`.
 | `https://api.open-meteo.com/v1/forecast` | Daily forecast | `latitude`, `longitude`, `daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,snowfall_sum,wind_speed_10m_max`, `timezone=auto`, `forecast_days=7` |
 | `https://marine-api.open-meteo.com/v1/marine` | Wave heights | `latitude`, `longitude`, `daily=wave_height_max`, `timezone=auto`, `forecast_days=7` |
 
-Default units: °C, mm of precipitation, cm of snowfall, km/h of wind, m of wave height.
+Both weather requests use the selected location's coordinates. I added the Marine API for wave height, which surfing needs. The mapper matches waves to forecast days by local date. It skips days with a missing or unknown weather code or a missing high or low. Missing scoring inputs stay `nil`. A response with zero usable days shows the empty state.
 
-**Why the Marine API.** The brief names the Geocoding and Forecast APIs, but the Forecast API has no wave data, and surfing can't be judged without it. The Marine API comes from the same provider, takes the same coordinates and runs in parallel with the forecast request. It is treated as optional (see Error handling).
+Scores use °C, mm of precipitation, cm of snowfall, km/h of wind and m of wave height. In the saved API responses, a search with zero matches omits `results`, and the inland Chamonix response returns HTTP 200 with `null` for every `wave_height_max`.
 
-**Observed behaviour**, checked against live responses that are kept as test fixtures:
-- When nothing matches, the geocoding response has **no `results` key** at all, rather than an empty array.
-- One-character queries return nothing, hence the 2-character minimum.
-- For inland locations, the Marine API answers **HTTP 200 with every `wave_height_max` set to `null`**, not an error.
-- Any daily value can be `null`, so every measurement is optional in the DTOs.
+The app uses Open-Meteo's free non-commercial API, with fewer than 10,000 calls per day under its terms. [Open-Meteo terms](https://open-meteo.com/en/terms)
 
-**Terms of use** (from Open-Meteo's documentation):
-- No API key needed.
-- The free API is for **non-commercial use only**, and under **10,000 calls a day**.
-- Data must be attributed to Open-Meteo. Marine data must also be attributed to the German Weather Service (**DWD**, ICON Wave model).
-
-The app doesn't show this attribution yet (see i and j).
+The app still needs in-app attribution for Open-Meteo and the providers of the models it uses. [Marine API provider credits](https://open-meteo.com/en/docs/marine-weather-api#citation--acknowledgement)
 
 ## g. Activity recommendation logic
 
-All scoring lives in `Domain/ActivityRecommendationService.swift`, a pure function of the forecast.
+Each activity gets a score from 0 to 1. The forecast displays it as a percentage. [`Domain/ActivityRecommendationService.swift`](weather-activities/Domain/ActivityRecommendationService.swift)
 
-Each activity gets a score from 0 (unsuitable) to 1 (ideal) for each day. It gets `nil` when the day lacks a measurement it depends on.
+- Outdoor sightseeing favours comfortable temperatures, dry weather and lighter wind. Fog and thunderstorms lower the score.
+- Indoor sightseeing scores higher when the outdoor score is low.
+- Surfing weighs maximum wave height, wind and warmth. A thunderstorm gives it a score of zero when the required measurements are available.
+- Skiing favours cold days and fresh snow. A high of 8 °C or above gives it a score of zero when snowfall data is available.
+
+Unscored activities sort after scored ones. Swift's stable `sorted(by:)` keeps ties in declaration order (surfing, outdoor sightseeing, indoor sightseeing, skiing).
+
+### Worked example
+
+Take a partly cloudy day in San Francisco with a high of 18 °C, zero rain, 14 km/h wind and 1.6 m waves.
+
+- Outdoor sightseeing gets **1.00** because comfort, dryness and calm each score 1.
+- Surfing gets **0.92**. The wave and calm factors are both 1, and the temperature factor is `0.5 + 0.5 × 0.83`.
+- Indoor sightseeing gets **0.35** from `0.35 + 0.6 × 0`.
+- Skiing gets **0** because the cold factor is 0.
+
+<details>
+<summary>Exact scoring formulas and WMO codes</summary>
 
 ### The `ramp` helper
 
@@ -230,7 +189,7 @@ Each activity gets a score from 0 (unsuitable) to 1 (ideal) for each day. It get
 ramp(value, from: a, to: b) = clamp((value − a) / (b − a), 0, 1)
 ```
 
-It's 0 at `a`, 1 at `b` and linear in between. `b` may be below `a` for "lower is better".
+The ramp is 0 at `a`, 1 at `b` and linear in between. A descending ramp gives lower values more weight.
 
 ### Outdoor sightseeing (needs precipitation and wind)
 
@@ -244,11 +203,11 @@ It's 0 at `a`, 1 at `b` and linear in between. `b` may be below `a` for "lower i
 
 ### Indoor sightseeing
 
-`score = 0.35 + 0.6 × (1 − outdoor sightseeing)`, so it ranges from **0.35** on a perfect day outside to **0.95** on the worst. Indoor sightseeing is always possible, so it never scores 0, but it is most worth recommending when outside is miserable. It is `nil` whenever outdoor sightseeing is.
+`score = 0.35 + 0.6 × (1 − outdoor sightseeing)` ranges from **0.35** on an ideal day outdoors to **0.95** when the outdoor score is zero. The indoor score is `nil` whenever the outdoor score is `nil`.
 
 ### Surfing (needs wave height and wind)
 
-A thunderstorm scores **0**. Otherwise:
+With wave and wind data available, a thunderstorm gives surfing a score of **0**.
 
 | Factor | Formula | Meaning |
 |---|---|---|
@@ -256,7 +215,7 @@ A thunderstorm scores **0**. Otherwise:
 | calm | `ramp(wind, 40 → 15)` | 1 at 15 km/h or less; 0 at 40 km/h or more |
 | warm | `ramp(high, 8 → 20)` | 1 at 20 °C or more; 0 at 8 °C or less |
 
-`score = waves × (0.6 + 0.4 × calm) × (0.5 + 0.5 × warm)`. Waves decide whether surfing is possible at all, while wind and temperature can each cost up to 40% and 50% of the score.
+`score = waves × (0.6 + 0.4 × calm) × (0.5 + 0.5 × warm)`. The wave factor can bring the score to zero. Wind can reduce it by up to 40%, and temperature by up to 50%.
 
 ### Skiing (needs snowfall)
 
@@ -266,12 +225,6 @@ A thunderstorm scores **0**. Otherwise:
 | fresh snow | `ramp(snowfall, 0 → 10)` | 1 at 10 cm or more of new snow |
 
 `score = cold × (0.3 + 0.7 × fresh snow)`
-
-### Ranking
-
-- Activities are sorted by score, best first. Unscored (`nil`) activities go last.
-- Ties keep declaration order (surfing, outdoor sightseeing, indoor sightseeing, skiing), because Swift's `sorted(by:)` is stable.
-- The top activity is highlighted as the day's best, but only if it has a score.
 
 ### Weather conditions (WMO codes)
 
@@ -286,53 +239,40 @@ A thunderstorm scores **0**. Otherwise:
 | 71–77, 85, 86 | Snow |
 | 95–99 | Thunderstorm |
 
-Any other code drops the day. Only fog and thunderstorm affect scores. The rest are for display.
+Only fog and thunderstorms change the score. The other conditions are for display.
 
-**Worked example.** San Francisco, partly cloudy, 18 °C high, no rain, 14 km/h wind, 1.6 m waves:
-- Outdoor sightseeing: comfort 1, dry 1, calm 1, so **1.00**.
-- Surfing: waves 1 × calm 1 × (0.5 + 0.5 × 0.83), so **0.92**.
-- Indoor sightseeing: 0.35 + 0.6 × 0, so **0.35**.
-- Skiing: cold 0, so **0**.
+</details>
 
 ## h. Assumptions
 
-- **The daily maximum stands for the day's temperature.** It's the temperature during daytime activities.
-- **Snowfall stands in for ski conditions.** The forecast has no snow depth or slope elevation, so freshly fallen snow is the best available signal. As a result, a freezing day with no new snow still scores 0.3: skiable, not ideal.
-- **Waves at the city's coordinates represent nearby surf.** Open-Meteo answers with the marine grid cell nearest the city (for San Francisco, about 4 km away). The app doesn't look for the nearest surf spot.
-- **"A ranked list of activities over the next 7 days" means a ranking for each day**, not one ranking for the week. Conditions change day to day, and a per-day ranking answers "what should I do on Saturday?".
-- **Dates are the city's local dates**, not the device's.
-- **Place names are in the device language.** The geocoding request passes the device's language code.
+I rank activities separately for each day because the best option can change during the week. The forecast uses the city's time zone, and geocoding asks for place names in the device language.
+
+The daily high stands in for daytime temperature. I use fresh snowfall as a proxy for ski conditions, which also depend on snow depth and slope elevation. A freezing day with zero new snow still scores 0.3. For surfing, I use the Marine API's grid cell for the city's coordinates as a proxy for nearby surf. In the San Francisco fixture, the grid cell is about 4 km from the city.
 
 ## i. Trade-offs and omissions
 
-- **No persistent or offline cache.** An in-memory cache was built and then removed, because it added more code and tests than it saved at this scope. An offline cache is the first production item (see j).
-- **10 search results.** That's enough to choose among same-name places without a scrolling list.
-- **Daily rather than hourly data.** It's simpler to reason about and test. The cost is that a dry morning followed by a stormy afternoon looks like one rainy day.
-- **Hand-tuned heuristics.** The thresholds are reasonable and documented, not learned from data.
-- **One UI smoke test, no snapshot tests.** Logic and state are covered by unit tests, and visual states by previews.
-- **English only**, although every user-facing string is a `LocalizedStringResource` or `String(localized:)` with translator comments. Adding a String Catalog extracts them.
-- **iOS 27 only**, which limits reach. The UI relies on iOS 26 APIs such as Liquid Glass, so iOS 26 is the earliest realistic target, but I haven't tested below iOS 27.
-- **No in-app data attribution yet**, which Open-Meteo's terms require.
+I limited search to 10 results to keep similar place names easy to scan. Daily summaries keep the scoring simple to explain and test. A dry morning and a wet afternoon still get a single ranking. The scoring thresholds are hand-tuned.
+
+Fetching a forecast requires a connection. I dropped an in-memory cache because it added more code and tests than it saved at this scale.
+
+The app ships in English, with localisable copy using `LocalizedStringResource`, `String(localized:)` and SwiftUI. It uses Liquid Glass APIs introduced in iOS 26 and targets iOS 27, where I tested it.
 
 ## j. Production-readiness notes
 
-What I would add before shipping:
-
-- **Offline cache:** persist the last forecast for each place and show it immediately, labelled with when it was last updated.
-- **Attribution** to Open-Meteo and DWD in the app.
-- **A commercial Open-Meteo plan, or self-hosting**, since the free tier is non-commercial and limited to 10,000 calls a day.
-- **Networking hardening:** explicit request timeouts, and retry with exponential backoff for connectivity errors and 5xx responses.
-- **Observability:** `os.Logger` with categories, crash reporting, and metrics for API failures.
-- **CI** that builds and tests every pull request, plus SwiftLint/SwiftFormat.
-- **A privacy manifest** declaring the `UserDefaults` API with reason `CA92.1`.
-- **Localization**, **snapshot tests**, and **UI tests against stubbed network data**, with the stub selected through a launch argument.
-- **Remotely tunable scoring thresholds**, so recommendations can be adjusted without an app release.
+- Persist the last forecast for each place and show when it was fetched so it can be used offline.
+- Add the data credits described in the API notes. For commercial use, choose an Open-Meteo paid plan or self-host the API. Add a privacy manifest for the app's use of `UserDefaults` (`CA92.1`). [Apple's privacy manifest technote](https://developer.apple.com/documentation/technotes/tn3183-adding-required-reason-api-entries-to-your-privacy-manifest)
+- Set request timeouts and use exponential backoff for connectivity errors and 5xx responses. Add `os.Logger`, crash reporting and API failure metrics.
+- Run builds and tests in CI with SwiftLint and SwiftFormat. Add snapshots, a live API contract check and a UI flow test with stubs selected at launch.
+- Add a String Catalog and translations. Make scoring thresholds configurable without an app release.
 
 ## k. Cross-platform delivery notes
 
-### Android equivalent
+On Android, I'd use Jetpack Compose for the screens and a `ViewModel` with `StateFlow` for each screen's state. Repository interfaces would keep scoring and presentation independent of the HTTP client.
 
-The architecture maps 1:1 onto Android:
+At this size, I'd keep both apps native and share the scoring spec, API fixtures and test vectors with expected scores and rankings. Running the same vectors on both platforms would catch differences in the recommendations. I'd revisit Kotlin Multiplatform if sharing the Domain and Data code justified the extra toolchain.
+
+<details>
+<summary>Android equivalents</summary>
 
 | iOS | Android |
 |---|---|
@@ -345,23 +285,10 @@ The architecture maps 1:1 onto Android:
 | `RecentLocationsStore` (`UserDefaults`) | DataStore |
 | Swift Testing + test doubles | JUnit + Turbine (+ fakes) |
 
-### Sharing code
-
-- **Kotlin Multiplatform** could share Domain and Data (models, scoring, DTOs, mapping, repositories) and keep the UI native. That's worth it once the shared logic grows.
-- **At this size, I'd recommend two native apps sharing artifacts instead of code:**
-  - A written scoring spec, which section g of this README already is.
-  - Golden test vectors: forecast days in, expected scores and rankings out.
-  - The captured API fixtures.
-
-  Both apps run the same vectors in their unit tests, so their recommendations can't drift apart, and neither team takes on a cross-platform toolchain.
+</details>
 
 ## l. AI usage disclosure
 
-I built this project with Claude Code (Anthropic) as a pair programmer: planning, writing code and tests, code review, and drafting this README.
+I used Claude Code (Anthropic) to plan, build and review the original app, tests and README. I used OpenAI Codex to review the project, fix overlapping forecast requests, add explanations for the activity scores and revise this README.
 
-How I verified the work:
-- **I approved every plan before it was implemented.** Architecture, state modelling and scoring decisions were mine to accept, change or reject.
-- **Every change was built with 0 warnings** in Swift 6 language mode, and the full unit test suite was run on it.
-- **Every UI state was checked in SwiftUI previews,** including accessibility text sizes and dark mode.
-- **The app was run on a physical iPhone.**
-- **API behaviour was checked against live Open-Meteo responses,** which are now kept as test fixtures, so the edge cases above (missing `results`, `null` waves inland) are pinned by tests rather than assumed.
+I reviewed the implementation plans and checked the app in SwiftUI previews and on a physical iPhone. I checked live Open-Meteo responses and kept them as fixtures. The latest iOS 27.1 simulator run passed 62 unit tests and the launch test. The coastal and inland layouts were also checked at standard and accessibility text sizes.

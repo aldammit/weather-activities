@@ -12,8 +12,11 @@ struct ForecastViewModelTests {
         Fixtures.day(.snow, high: -5, precipitation: 12, snowfall: 15, wind: 15),
     ])
 
-    private func makeViewModel(_ weather: ScriptedWeatherRepository) -> ForecastViewModel {
-        ForecastViewModel(location: Fixtures.parisTexas, weather: weather)
+    private func makeViewModel(
+        _ weather: any WeatherRepository,
+        state: ForecastState = .loading
+    ) -> ForecastViewModel {
+        ForecastViewModel(location: Fixtures.parisTexas, weather: weather, state: state)
     }
 
     private func content(for forecast: Forecast) throws -> ForecastContent {
@@ -45,6 +48,23 @@ struct ForecastViewModelTests {
         #expect(weather.requestCount == 1)
     }
 
+    @Test func overlappingLoadAndRetryAreIgnored() async throws {
+        let expected = try content(for: sunnyThenRainy)
+        let weather = ControlledWeatherRepository(subsequentForecast: snowy)
+        let viewModel = makeViewModel(weather)
+        let firstLoad = Task { await viewModel.load() }
+        await weather.waitForFirstRequest()
+
+        await viewModel.load()
+        await viewModel.retry()
+
+        #expect(await weather.requestCount == 1)
+        #expect(viewModel.state == .loading)
+        await weather.finishFirstRequest(with: .success(sunnyThenRainy))
+        await firstLoad.value
+        #expect(viewModel.state == .loaded(expected, refresh: .idle))
+    }
+
     @Test func failureThenRetry() async throws {
         let weather = ScriptedWeatherRepository(.failure(.connectivity), .success(sunnyThenRainy))
         let viewModel = makeViewModel(weather)
@@ -55,6 +75,24 @@ struct ForecastViewModelTests {
         await viewModel.retry()
         #expect(viewModel.state == .loaded(try content(for: sunnyThenRainy), refresh: .idle))
         #expect(weather.requestCount == 2)
+    }
+
+    @Test(arguments: [ForecastState.failed(.connectivity), .empty])
+    func retryStartsOnlyOneRequest(previousState: ForecastState) async throws {
+        let expected = try content(for: sunnyThenRainy)
+        let weather = ControlledWeatherRepository(subsequentForecast: snowy)
+        let viewModel = makeViewModel(weather, state: previousState)
+        let firstRetry = Task { await viewModel.retry() }
+        await weather.waitForFirstRequest()
+
+        #expect(viewModel.state == .loading)
+        await viewModel.retry()
+        await viewModel.load()
+
+        #expect(await weather.requestCount == 1)
+        await weather.finishFirstRequest(with: .success(sunnyThenRainy))
+        await firstRetry.value
+        #expect(viewModel.state == .loaded(expected, refresh: .idle))
     }
 
     @Test func refreshFailureKeepsTheContent() async throws {
@@ -90,14 +128,76 @@ struct ForecastViewModelTests {
     }
 
     @Test func refreshWhileRefreshingIsIgnored() async throws {
-        let weather = ScriptedWeatherRepository(.success(snowy))
-        let refreshing = ForecastState.loaded(try content(for: sunnyThenRainy), refresh: .refreshing)
-        let viewModel = ForecastViewModel(location: Fixtures.parisTexas, weather: weather, state: refreshing)
+        let shown = try content(for: sunnyThenRainy)
+        let expected = try content(for: snowy)
+        let weather = ControlledWeatherRepository(subsequentForecast: sunnyThenRainy)
+        let viewModel = makeViewModel(weather, state: .loaded(shown, refresh: .idle))
+        let firstRefresh = Task { await viewModel.refresh() }
+        await weather.waitForFirstRequest()
+
+        #expect(viewModel.state == .loaded(shown, refresh: .refreshing))
+        await viewModel.refresh()
+        await viewModel.retry()
+        await viewModel.load()
+
+        #expect(await weather.requestCount == 1)
+        #expect(viewModel.state == .loaded(shown, refresh: .refreshing))
+        await weather.finishFirstRequest(with: .success(snowy))
+        await firstRefresh.value
+        #expect(viewModel.state == .loaded(expected, refresh: .idle))
+    }
+
+    @Test(arguments: [nil, .httpStatus(503)] as [RepositoryError?])
+    func cancelledRefreshRestoresPreviousState(lateError: RepositoryError?) async throws {
+        let shown = try content(for: sunnyThenRainy)
+        let expected = try content(for: snowy)
+        let previousState = ForecastState.loaded(shown, refresh: .failed(.connectivity))
+        let weather = ControlledWeatherRepository(subsequentForecast: snowy)
+        let viewModel = makeViewModel(weather, state: previousState)
+        let firstRefresh = Task { await viewModel.refresh() }
+        await weather.waitForFirstRequest()
+
+        firstRefresh.cancel()
+        await viewModel.refresh()
+        #expect(await weather.requestCount == 1)
+
+        let lateResult: Result<Forecast, any Error> = if let lateError {
+            .failure(lateError)
+        } else {
+            .success(snowy)
+        }
+        await weather.finishFirstRequest(with: lateResult)
+        await firstRefresh.value
+        #expect(viewModel.state == previousState)
 
         await viewModel.refresh()
+        #expect(await weather.requestCount == 2)
+        #expect(viewModel.state == .loaded(expected, refresh: .idle))
+    }
 
-        #expect(viewModel.state == refreshing)
+    @Test func repositoryCancellationRestoresRetryState() async {
+        let previousState = ForecastState.failed(.connectivity)
+        let weather = ControlledWeatherRepository(subsequentForecast: snowy)
+        let viewModel = makeViewModel(weather, state: previousState)
+        let retry = Task { await viewModel.retry() }
+        await weather.waitForFirstRequest()
+
+        await weather.finishFirstRequest(with: .failure(CancellationError()))
+        await retry.value
+
+        #expect(viewModel.state == previousState)
+    }
+
+    @Test func taskCancelledBeforeFetchLeavesStateIntact() async throws {
+        let previousState = ForecastState.loaded(try content(for: sunnyThenRainy), refresh: .idle)
+        let weather = ScriptedWeatherRepository(.success(snowy))
+        let viewModel = makeViewModel(weather, state: previousState)
+        let refresh = Task { await viewModel.refresh() }
+        refresh.cancel()
+        await refresh.value
+
         #expect(weather.requestCount == 0)
+        #expect(viewModel.state == previousState)
     }
 
     @Test func noUsableDaysIsEmpty() async {
@@ -107,5 +207,41 @@ struct ForecastViewModelTests {
         await viewModel.load()
 
         #expect(viewModel.state == .empty)
+    }
+}
+
+/// Suspends the first request until the test responds, even if its task is cancelled.
+/// Extra requests return immediately so an overlap fails the test on the request count.
+private actor ControlledWeatherRepository: WeatherRepository {
+    private let firstRequestStarted: AsyncStream<Void>
+    private let startSignal: AsyncStream<Void>.Continuation
+    private let subsequentForecast: Forecast
+    private var firstResponse: CheckedContinuation<Forecast, any Error>?
+    private(set) var requestCount = 0
+
+    init(subsequentForecast: Forecast) {
+        self.subsequentForecast = subsequentForecast
+        (firstRequestStarted, startSignal) = AsyncStream.makeStream(of: Void.self)
+    }
+
+    func waitForFirstRequest() async {
+        var starts = firstRequestStarted.makeAsyncIterator()
+        _ = await starts.next()
+    }
+
+    func forecast(for location: Location) async throws -> Forecast {
+        requestCount += 1
+        guard requestCount == 1 else { return subsequentForecast }
+        return try await withCheckedThrowingContinuation { continuation in
+            firstResponse = continuation
+            startSignal.yield(())
+            startSignal.finish()
+        }
+    }
+
+    func finishFirstRequest(with result: Result<Forecast, any Error>) {
+        let response = firstResponse
+        firstResponse = nil
+        response?.resume(with: result)
     }
 }

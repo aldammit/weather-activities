@@ -9,8 +9,12 @@ struct ActivityRecommendationServiceTests {
         service.recommendation(for: day).rankedScores.map(\.activity)
     }
 
+    private func result(for activity: Activity, on day: DailyWeather) -> ActivityScore? {
+        service.recommendation(for: day).rankedScores.first { $0.activity == activity }
+    }
+
     private func score(_ activity: Activity, for day: DailyWeather) -> Double? {
-        service.recommendation(for: day).rankedScores.first { $0.activity == activity }?.score
+        result(for: activity, on: day)?.score
     }
 
     @Test func dryWarmDayRanksOutdoorSightseeingFirst() {
@@ -19,10 +23,14 @@ struct ActivityRecommendationServiceTests {
         #expect(ranking(for: day).first == .outdoorSightseeing)
     }
 
-    @Test func rainyDayRanksIndoorSightseeingFirst() {
+    @Test func rainyDayRanksIndoorSightseeingFirst() throws {
         let day = Fixtures.day(.rain, high: 14, precipitation: 12, wind: 25, waves: 0.2)
 
         #expect(ranking(for: day).first == .indoorSightseeing)
+        let outdoor = try #require(result(for: .outdoorSightseeing, on: day))
+        let outdoorScore = try #require(outdoor.score)
+        #expect(outdoor.reason == .outdoorSightseeing(highC: 14, precipitationMM: 12, windKmh: 25, penalty: nil))
+        #expect(result(for: .indoorSightseeing, on: day)?.reason == .indoorSightseeing(outdoorScore: outdoorScore))
     }
 
     @Test func freshSnowOnAColdDayRanksSkiingFirst() {
@@ -30,6 +38,14 @@ struct ActivityRecommendationServiceTests {
 
         #expect(ranking(for: day).first == .skiing)
         #expect(score(.skiing, for: day) == 1)
+        #expect(result(for: .skiing, on: day)?.reason == .skiing(highC: -5, snowfallCM: 15))
+    }
+
+    @Test func skiingExplainsTheTemperatureCutoff() {
+        let day = Fixtures.day(high: 8, snowfall: 10)
+
+        #expect(score(.skiing, for: day) == 0)
+        #expect(result(for: .skiing, on: day)?.reason == .skiingTooWarm(highC: 8))
     }
 
     @Test func goodWavesAndLightWindScoreSurfingHigh() throws {
@@ -39,12 +55,33 @@ struct ActivityRecommendationServiceTests {
         #expect(surfing >= 0.9)
         // Ties with outdoor sightseeing; `Activity.allCases` order puts surfing first.
         #expect(ranking(for: day).first == .surfing)
+        #expect(result(for: .surfing, on: day)?.reason == .surfing(waveHeightM: 1.5, windKmh: 10, highC: 21))
     }
 
     @Test func thunderstormRulesOutSurfing() {
         let day = Fixtures.day(.thunderstorm, high: 21, wind: 10, waves: 1.5)
 
         #expect(score(.surfing, for: day) == 0)
+        #expect(result(for: .surfing, on: day)?.reason == .surfingThunderstorm)
+        #expect(result(for: .outdoorSightseeing, on: day)?.reason == .outdoorSightseeing(
+            highC: 21, precipitationMM: 0, windKmh: 10, penalty: .thunderstorm
+        ))
+    }
+
+    @Test(arguments: [0.3, 3.5])
+    func surfingExplainsTheWaveHeightCutoffs(waveHeight: Double) {
+        let day = Fixtures.day(waves: waveHeight)
+
+        #expect(score(.surfing, for: day) == 0)
+        #expect(result(for: .surfing, on: day)?.reason == .surfingWavesOutOfRange(waveHeightM: waveHeight))
+    }
+
+    @Test func outdoorSightseeingExplainsTheFogPenalty() {
+        let day = Fixtures.day(.fog, high: 22, precipitation: 0, wind: 10)
+
+        #expect(result(for: .outdoorSightseeing, on: day)?.reason == .outdoorSightseeing(
+            highC: 22, precipitationMM: 0, windKmh: 10, penalty: .fog
+        ))
     }
 
     @Test func missingWaveDataLeavesSurfingUnscoredAndLast() {
@@ -54,6 +91,7 @@ struct ActivityRecommendationServiceTests {
 
         #expect(score(.surfing, for: day) == nil)
         #expect(recommendation.rankedScores.last?.activity == .surfing)
+        #expect(recommendation.rankedScores.last?.reason == .missingData([.waveHeight]))
         #expect(recommendation.best?.activity != .surfing)
     }
 
@@ -72,6 +110,12 @@ struct ActivityRecommendationServiceTests {
 
         #expect(recommendation.best == nil)
         #expect(recommendation.rankedScores.map(\.activity) == Activity.allCases)
+        #expect(recommendation.rankedScores.map(\.reason) == [
+            .missingData([.waveHeight, .windSpeed]),
+            .missingData([.precipitation, .windSpeed]),
+            .missingData([.precipitation, .windSpeed]),
+            .missingData([.snowfall]),
+        ])
     }
 
     @Test func scoresStayWithinZeroToOne() {

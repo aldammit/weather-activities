@@ -47,6 +47,7 @@ final class ForecastViewModel {
 
     @ObservationIgnored private let weather: any WeatherRepository
     @ObservationIgnored private let recommender = ActivityRecommendationService()
+    @ObservationIgnored private var isFetching = false
 
     /// `state` sets a starting point for previews. `load()` only fetches from `.loading`.
     init(location: Location, weather: any WeatherRepository, state: ForecastState = .loading) {
@@ -55,7 +56,7 @@ final class ForecastViewModel {
         self.state = state
     }
 
-    /// Initial load. Safe to call again: it does nothing once something is on screen.
+    /// Starts the initial load if no request is already running.
     func load() async {
         guard state == .loading else { return }
         await fetch()
@@ -64,33 +65,45 @@ final class ForecastViewModel {
     /// Fetches fresh data and keeps the current forecast visible until it arrives.
     /// Does nothing unless a forecast is loaded and no refresh is already running.
     func refresh() async {
-        guard case .loaded(let content, let status) = state, status != .refreshing else { return }
-        state = .loaded(content, refresh: .refreshing)
+        guard case .loaded(_, let status) = state, status != .refreshing else { return }
         await fetch()
     }
 
-    /// Starts over from the loading state.
+    /// Tries again after a failed or empty forecast.
     func retry() async {
-        state = .loading
-        await fetch()
+        switch state {
+        case .failed, .empty:
+            await fetch()
+        case .loading, .loaded:
+            return
+        }
     }
 
     private func fetch() async {
-        let shown = state.content  // kept on screen if this fetch fails or is cancelled
+        guard !isFetching, !Task.isCancelled else { return }
+        isFetching = true
+        defer { isFetching = false }
+
+        let previousState = state
+        let shown = previousState.content
+        state = shown.map { .loaded($0, refresh: .refreshing) } ?? .loading
+
         do {
             let forecast = try await weather.forecast(for: location)
+            try Task.checkCancellation()
             let days = recommender.recommendations(for: forecast)
             if let content = ForecastContent(timeZone: forecast.timeZone, days: days) {
                 state = .loaded(content, refresh: .idle)
             } else {
                 state = .empty
             }
+        } catch let error where Task.isCancelled || error is CancellationError {
+            state = previousState
         } catch let error as RepositoryError {
-            if let shown { state = .loaded(shown, refresh: .failed(error)) } else { state = .failed(error) }
+            state = shown.map { .loaded($0, refresh: .failed(error)) } ?? .failed(error)
         } catch {
-            assert(error is CancellationError, "Repositories throw only RepositoryError or CancellationError")
-            // Cancelled: put back what was shown, or stay in `.loading` so the next `load()` starts over.
-            if let shown { state = .loaded(shown, refresh: .idle) }
+            state = previousState
+            assertionFailure("Repositories throw only RepositoryError or CancellationError")
         }
     }
 }
