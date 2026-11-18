@@ -289,6 +289,4 @@ At this size, I'd keep both apps native and share the scoring spec, API fixtures
 
 ## l. AI usage disclosure
 
-I used Claude Code (Anthropic) to plan, build and review the original app, tests and README. I used OpenAI Codex to review the project, fix overlapping forecast requests, add explanations for the activity scores and revise this README.
-
-I reviewed the implementation plans and checked the app in SwiftUI previews and on a physical iPhone. I checked live Open-Meteo responses and kept them as fixtures. The latest iOS 27.1 simulator run passed 62 unit tests and the launch test. The coastal and inland layouts were also checked at standard and accessibility text sizes.
+I used Claude Code to implement SwiftUI interfaces, API layer, tests, and first draft of the README. All Source code verified and tested by me on physical device and simulator
